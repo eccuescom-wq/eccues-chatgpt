@@ -212,6 +212,10 @@ async def on_text(update:Update, context:ContextTypes.DEFAULT_TYPE):
 # ===== Main (webhook cho Render) =====
 async def _post_init(app):  # set menu trái
     await set_bot_commands(app)
+from aiohttp import web
+
+async def health(request):
+    return web.Response(text="ok")  # 200 OK
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
@@ -229,11 +233,14 @@ def main():
     if not WEBHOOK_URL:
         print("❌ Chưa cấu hình WEBHOOK_URL — hãy thêm env và redeploy.")
     # Webhook mode cho Render
+    app.web_app.add_get("/", health)
+    app.web_app.add_get("/healthz", health)
+
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path="telegram",
-        webhook_url=WEBHOOK_URL or f"http://localhost:{PORT}/telegram",
+        webhook_url="https://eccues-chatgpt-bot.onrender.com/telegram",   # phải là https://<service>.onrender.com/telegram
     )
 
 if __name__ == "__main__":
