@@ -221,41 +221,55 @@ async def on_text(update:Update, context:ContextTypes.DEFAULT_TYPE):
     answer = llm_reply(txt, extra_context=extra)
     await update.message.reply_text(answer, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
-# ===== Main (webhook cho Render) =====
+# ===== Main (webhook với aiohttp riêng, có / và /healthz) =====
+import asyncio
+from aiohttp import web
+
 async def _post_init(app):
     await set_bot_commands(app)
 
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
+async def health(request):
+    return web.Response(text="ok")
 
-    # Handlers
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CommandHandler("catalog", cmd_catalog))
-    app.add_handler(CommandHandler("search", cmd_search))
-    app.add_handler(CommandHandler("warranty", cmd_warranty))
-    app.add_handler(CommandHandler("leadtime", cmd_leadtime))
-    app.add_handler(CommandHandler("contact", cmd_contact))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+async def amain():
+    # 1) Tạo Application (PTB)
+    application = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
 
-    # Health endpoints cho Render
-    if web:
-        app.web_app.add_get("/",      lambda req: web.Response(text="ok"))
-        app.web_app.add_get("/healthz", lambda req: web.Response(text="ok"))
+    # 2) Khởi động vòng đời PTB (custom server -> tự init/start/stop)
+    await application.initialize()
+    await application.start()
 
     if not WEBHOOK_URL:
-        logger.warning("⚠️ Chưa có WEBHOOK_URL hay RENDER_EXTERNAL_URL. "
-                       "Hãy set WEBHOOK_URL=https://<service>.onrender.com/telegram rồi redeploy.")
+        # Render nên set WEBHOOK_URL = https://<service>.onrender.com/telegram
+        print("⚠️ Chưa có WEBHOOK_URL. Hãy đặt biến môi trường WEBHOOK_URL và redeploy.")
+    else:
+        # 3) Đăng ký webhook với Telegram
+        await application.bot.set_webhook(WEBHOOK_URL)
 
-    logger.info("Starting webhook on port %s, webhook_url=%s", PORT, WEBHOOK_URL)
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path="telegram",
-        webhook_url=WEBHOOK_URL or f"http://localhost:{PORT}/telegram",
-    )
+    # 4) Tạo web server aiohttp và gắn routes
+    web_app = web.Application()
+    web_app.router.add_get("/", health)
+    web_app.router.add_get("/healthz", health)
+    # ĐÂY là handler webhook của PTB (nhận POST từ Telegram)
+    web_app.router.add_post("/telegram", application.webhook_handler())
+
+    # 5) Run server
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+    await site.start()
+
+    # 6) Treo tiến trình
+    try:
+        await asyncio.Event().wait()
+    finally:
+        # 7) Shutdown gọn gàng nếu Render stop
+        await application.stop()
+        await application.shutdown()
+        await runner.cleanup()
+
+def main():
+    asyncio.run(amain())
 
 if __name__ == "__main__":
     main()
