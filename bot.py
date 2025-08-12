@@ -1,4 +1,4 @@
-# bot.py — Telegram bot tư vấn cơ bi-a (webhook cho Render)
+# bot.py — Telegram bot tư vấn cơ bi-a (Render, webhook)
 import os, re, logging
 from typing import Tuple
 import pandas as pd
@@ -15,20 +15,33 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters
 )
 
+# ---- Try to import aiohttp.web for health endpoints
+try:
+    from aiohttp import web
+except Exception:
+    web = None
+
 # ===== ENV =====
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-MODEL = os.getenv("MODEL", "gpt-4o-mini")
-CATALOG_PATH = os.getenv("CATALOG_PATH", "Exc.csv")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")          # ví dụ: https://<service>.onrender.com/telegram
-PORT = int(os.getenv("PORT", "8080"))           # Render tự set PORT
 
-if not (BOT_TOKEN and OPENAI_API_KEY):
-    raise RuntimeError("Thiếu BOT_TOKEN hoặc OPENAI_API_KEY trong env")
-if not WEBHOOK_URL:
-    # Chấp nhận thiếu tạm thời lần deploy đầu; sẽ báo rõ ràng trong log
-    print("⚠️ Chưa có WEBHOOK_URL. Sau khi có URL Render, hãy thêm env này và redeploy.")
+BOT_TOKEN       = os.getenv("BOT_TOKEN")
+OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
+MODEL           = os.getenv("MODEL", "gpt-4o-mini")
+CATALOG_PATH    = os.getenv("CATALOG_PATH", "Exc.csv")
+
+# Render cung cấp RENDER_EXTERNAL_URL, dùng làm mặc định nếu WEBHOOK_URL trống
+_webhook_base   = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
+if _webhook_base:
+    if _webhook_base.endswith("/"):
+        _webhook_base = _webhook_base[:-1]
+    WEBHOOK_URL = f"{_webhook_base}/telegram"
+else:
+    WEBHOOK_URL = None  # sẽ cảnh báo lúc chạy
+
+PORT = int(os.getenv("PORT", "8080"))
+
+if not BOT_TOKEN or not OPENAI_API_KEY:
+    raise RuntimeError("Thiếu BOT_TOKEN hoặc OPENAI_API_KEY trong biến môi trường.")
 
 # ===== Logging =====
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -44,14 +57,18 @@ def load_catalog(path: str) -> pd.DataFrame:
         except Exception:
             pass
     if df is None:
-        raise RuntimeError("Không đọc được CSV.")
-    df.columns = [str(c).strip() for c in df.columns]
-    rename_map = {
-        "Mã":"ma","Hàng thường":"hang_thuong","Hàng thường":"hang_thuong",
-        "Cao cấp":"cao_cap","Cao cấp":"cao_cap","Thời gian làm":"thoi_gian_lam","Thời gian làm":"thoi_gian_lam"
-    }
-    for k,v in rename_map.items():
-        if k in df.columns: df = df.rename(columns={k:v})
+        logger.warning("⚠️ Không đọc được CSV từ %s — bot vẫn chạy nhưng /catalog sẽ trống.", path)
+        df = pd.DataFrame()
+    else:
+        df.columns = [str(c).strip() for c in df.columns]
+        rename_map = {
+            "Mã":"ma","Hàng thường":"hang_thuong","Hàng th??ng":"hang_thuong",
+            "Cao cấp":"cao_cap","Cao c?p":"cao_cap",
+            "Thời gian làm":"thoi_gian_lam","Th?i gian làm":"thoi_gian_lam"
+        }
+        for k,v in rename_map.items():
+            if k in df.columns:
+                df = df.rename(columns={k:v})
     return df
 
 CATALOG = load_catalog(CATALOG_PATH)
@@ -70,20 +87,20 @@ def llm_reply(user_text: str, extra_context: str = "") -> str:
         input=[{"role":"system","content":SYSTEM_PROMPT},
                {"role":"user","content":prompt}],
     )
-    try: return resp.output_text.strip()
-    except Exception: return str(resp)
+    try:
+        return resp.output_text.strip()
+    except Exception:
+        return str(resp)
 
 # ===== Search + Pagination =====
 PAGE_SIZE = 10
 def format_item_row(r: pd.Series) -> str:
-    ma = str(r.get("ma","")).strip()
-    ht = str(r.get("hang_thuong","")).strip()
-    cc = str(r.get("cao_cap","")).strip()
-    tg = str(r.get("thoi_gian_lam","")).strip()
+    def g(col): return str(r.get(col,"")).strip()
+    ma, ht, cc, tg = g("ma"), g("hang_thuong"), g("cao_cap"), g("thoi_gian_lam")
     extra=[]
     for c in CATALOG.columns:
         if c not in ["ma","hang_thuong","cao_cap","thoi_gian_lam"]:
-            v=str(r.get(c,"")).strip()
+            v=g(c)
             if v and v.lower()!="nan": extra.append(f"{c}: {v}")
     line=f"• {ma or '[không có mã]'}"
     if ht: line+=f" | Hàng thường: {ht}"
@@ -92,24 +109,28 @@ def format_item_row(r: pd.Series) -> str:
     return (line+(" | "+" | ".join(extra) if extra else "")).strip()
 
 def build_page(df: pd.DataFrame, page:int)->tuple[str,InlineKeyboardMarkup|None]:
-    total=len(df); 
+    total=len(df)
     if total==0: return "Không có dữ liệu.", None
-    maxp=(total+PAGE_SIZE-1)//PAGE_SIZE; page=max(1,min(page,maxp))
-    start=(page-1)*PAGE_SIZE; chunk=df.iloc[start:start+PAGE_SIZE]
+    maxp=(total+PAGE_SIZE-1)//PAGE_SIZE
+    page=max(1,min(page,maxp))
+    start=(page-1)*PAGE_SIZE
+    chunk=df.iloc[start:start+PAGE_SIZE]
     lines=[format_item_row(r) for _,r in chunk.iterrows()]
     text=f"📚 Trang {page}/{maxp} — Tổng {total} sản phẩm\n"+"\n".join(lines)
-    btn=[]
-    row=[]
+    btn=[]; row=[]
     if page>1: row.append(InlineKeyboardButton("⬅️ Trang trước", callback_data=f"CATALOG|P={page-1}"))
     if page<maxp: row.append(InlineKeyboardButton("Trang sau ➡️", callback_data=f"CATALOG|P={page+1}"))
     if row: btn.append(row)
     return text, InlineKeyboardMarkup(btn) if btn else None
 
 def search_df(q:str, df:pd.DataFrame)->pd.DataFrame:
+    if df.empty: return df
     qn=q.lower(); mask=pd.Series([False]*len(df))
     for col in df.columns:
-        try: mask = mask | df[col].astype(str).str.lower().str.contains(qn, na=False)
-        except Exception: pass
+        try:
+            mask = mask | df[col].astype(str).str.lower().str.contains(qn, na=False)
+        except Exception:
+            pass
     return df[mask]
 
 # ===== Menu (trên trái + bàn phím nhanh) =====
@@ -126,19 +147,9 @@ MAIN_KB=ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-# Nội dung tĩnh (có thể đưa vào .env hoặc sửa trực tiếp)
-WARRANTY_TEXT = os.getenv(
-    "WARRANTY_TEXT",
-    "🛡️ Cam kết và bảo hành:\n- Tùy theo chất lượng sản phẩm. Chúng tôi cam kết đạt >95% đối với Exc và >90% đối với zencues. \n- Sơn lại miễn phí 1 lần. tối đa không quá 1 năm.",
-)
-LEADTIME_TEXT = os.getenv(
-    "LEADTIME_TEXT",
-    "⏱️ Thời gian sản xuất (tham khảo):\n- Hàng thường: 2–3 tháng.\n- Hàng cao cấp: 3–4 tháng.\n(Lịch có thể thay đổi theo mẫu gỗ & độ phức tạp inlay).",
-)
-CONTACT_TEXT = os.getenv(
-    "CONTACT_TEXT",
-    "📞 Liên hệ:\n- Telegram: @eccues\n- Sản xuất lại: China \nVui lòng nhắn mã sản phẩm + ngân sách + thời gian cần hàng.",
-)
+WARRANTY_TEXT=os.getenv("WARRANTY_TEXT","🛡️ Bảo hành 12 tháng (lỗi kỹ thuật). Không áp dụng hao mòn/va đập/ngấm nước. Hỗ trợ cân chỉnh trọn đời.")
+LEADTIME_TEXT=os.getenv("LEADTIME_TEXT","⏱️ Hàng thường: 2–3 tháng; Cao cấp: 3–4 tháng (tuỳ mẫu gỗ & inlay).")
+CONTACT_TEXT=os.getenv("CONTACT_TEXT","📞 Zalo/Telegram: @yourshop | Hotline: 09xx xxx xxx | Địa chỉ xưởng: ...")
 
 LIST_PAT=re.compile(r"(có\s+những\s+sản\s+phẩm|cung cấp sản phẩm|danh\s*sách|list|catalog)", re.I)
 
@@ -189,8 +200,10 @@ async def cmd_contact(update:Update, context:ContextTypes.DEFAULT_TYPE):
 
 async def on_callback(update:Update, context:ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
-    try: page=int((q.data or "").split("P=",1)[1])
-    except Exception: page=1
+    try:
+        page=int((q.data or "").split("P=",1)[1])
+    except Exception:
+        page=1
     view=context.user_data.get("catalog_view",{"mode":"ALL"})
     df=context.user_data.get("last_results", CATALOG) if view.get("mode")=="SEARCH" else CATALOG
     text,kb=build_page(df,page)
@@ -203,22 +216,19 @@ async def on_text(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if txt==MENU_LABELS["leadtime"]: await cmd_leadtime(update,context); return
     if txt==MENU_LABELS["contact"]: await cmd_contact(update,context); return
     if LIST_PAT.search(txt): await cmd_catalog(update,context); return
-
     found = search_df(txt, CATALOG).head(10)
     extra = "\n".join(format_item_row(r) for _, r in found.iterrows())
     answer = llm_reply(txt, extra_context=extra)
     await update.message.reply_text(answer, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 # ===== Main (webhook cho Render) =====
-async def _post_init(app):  # set menu trái
+async def _post_init(app):
     await set_bot_commands(app)
-from aiohttp import web
-
-async def health(request):
-    return web.Response(text="ok")  # 200 OK
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
+
+    # Handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("menu", cmd_menu))
@@ -230,17 +240,21 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    if not WEBHOOK_URL:
-        print("❌ Chưa cấu hình WEBHOOK_URL — hãy thêm env và redeploy.")
-    # Webhook mode cho Render
-    app.web_app.add_get("/", health)
-    app.web_app.add_get("/healthz", health)
+    # Health endpoints cho Render
+    if web:
+        app.web_app.add_get("/",      lambda req: web.Response(text="ok"))
+        app.web_app.add_get("/healthz", lambda req: web.Response(text="ok"))
 
+    if not WEBHOOK_URL:
+        logger.warning("⚠️ Chưa có WEBHOOK_URL hay RENDER_EXTERNAL_URL. "
+                       "Hãy set WEBHOOK_URL=https://<service>.onrender.com/telegram rồi redeploy.")
+
+    logger.info("Starting webhook on port %s, webhook_url=%s", PORT, WEBHOOK_URL)
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path="telegram",
-        webhook_url="https://eccues-chatgpt-bot.onrender.com/telegram",   # phải là https://<service>.onrender.com/telegram
+        webhook_url=WEBHOOK_URL or f"http://localhost:{PORT}/telegram",
     )
 
 if __name__ == "__main__":
