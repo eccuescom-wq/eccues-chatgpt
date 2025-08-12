@@ -147,9 +147,9 @@ MAIN_KB=ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-WARRANTY_TEXT=os.getenv("WARRANTY_TEXT","🛡️ Bảo hành 12 tháng (lỗi kỹ thuật). Không áp dụng hao mòn/va đập/ngấm nước. Hỗ trợ cân chỉnh trọn đời.")
+WARRANTY_TEXT=os.getenv("WARRANTY_TEXT","🛡️Cam kết sản phẩm exc cao cấp >95%, bản thường >90%, hàng Zen >90%. Miễn phí sơn 1 lần tối đa 1 năm")
 LEADTIME_TEXT=os.getenv("LEADTIME_TEXT","⏱️ Hàng thường: 2–3 tháng; Cao cấp: 3–4 tháng (tuỳ mẫu gỗ & inlay).")
-CONTACT_TEXT=os.getenv("CONTACT_TEXT","📞 Zalo/Telegram: @yourshop | Hotline: 09xx xxx xxx | Địa chỉ xưởng: ...")
+CONTACT_TEXT=os.getenv("CONTACT_TEXT","📞 Telegram: @eccues | Địa chỉ xưởng: Trung Quốc")
 
 LIST_PAT=re.compile(r"(có\s+những\s+sản\s+phẩm|cung cấp sản phẩm|danh\s*sách|list|catalog)", re.I)
 
