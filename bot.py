@@ -1,157 +1,184 @@
+# bot.py — ECCues Telegram Bot (Render, PTB v22, aiohttp webhook)
 import os
 import re
-import pandas as pd
 import asyncio
+import logging
+import pandas as pd
 from aiohttp import web
-from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-from openai import OpenAI
+from dotenv import load_dotenv
 
-# ===== CONFIG =====
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-MODEL = os.getenv("MODEL", "gpt-4o-mini")
+from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, BotCommand
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters
+)
+
+# ================== ENV & LOGGING ==================
+load_dotenv()
+BOT_TOKEN    = os.getenv("BOT_TOKEN")
 CATALOG_PATH = os.getenv("CATALOG_PATH", "Exc.csv")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-PORT = int(os.getenv("PORT", 10000))
+WEBHOOK_URL  = os.getenv("WEBHOOK_URL")  # ví dụ: https://<service>.onrender.com/telegram
+PORT         = int(os.getenv("PORT", "8080"))
 
-oai = OpenAI(api_key=OPENAI_API_KEY)
+if not BOT_TOKEN:
+    raise RuntimeError("Thiếu BOT_TOKEN trong biến môi trường.")
 
-# ===== MENU =====
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("eccues-bot")
+
+# ================== NỘI DUNG CỐ ĐỊNH ==================
 MENU_LABELS = {
-    "catalog": "📋 Danh sách sản phẩm",
+    "catalog":  "📋 Danh sách sản phẩm",
     "warranty": "🛡️ Chế độ bảo hành",
     "leadtime": "⏳ Thời gian sản xuất",
-    "contact": "📞 Liên hệ"
+    "contact":  "📞 Liên hệ"
 }
 
-# ===== TEXTS =====
+MAIN_KB = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton(MENU_LABELS["catalog"])],
+        [KeyboardButton(MENU_LABELS["warranty"])],
+        [KeyboardButton(MENU_LABELS["leadtime"])],
+        [KeyboardButton(MENU_LABELS["contact"])],
+    ],
+    resize_keyboard=True
+)
+
 WARRANTY_TEXT = (
-    "🛡️ *Chế độ bảo hành*\n\n"
+    "🛡️ *Chế độ bảo hành*\n"
     "- Hàng cao cấp: cam kết chất lượng giống chính hãng >95%\n"
     "- Hàng trung bình: >90%\n"
     "- Zen: >90%\n"
     "- Sơn lại miễn phí 1 lần (thời gian không quá 1 năm)"
 )
-LEADTIME_TEXT = (
-    "⏳ *Thời gian sản xuất*\n\n"
-    "Thông thường từ 3–4 tháng tùy mẫu."
-)
+LEADTIME_TEXT = "⏳ *Thời gian sản xuất*: thường 3–4 tháng (tuỳ mẫu)."
 CONTACT_TEXT = (
-    "📞 *Liên hệ*\n\n"
+    "📞 *Liên hệ chốt đơn*\n"
     "Telegram: @eccues\n"
     "Facebook: https://www.facebook.com/share/1CJbMHsZEM/?mibextid=wwXIfr"
 )
 
-# ===== PROMPT =====
-SYSTEM_PROMPT = """Bạn là trợ lý bán cơ bi-a. Mục tiêu: trả lời NGẮN, ĐÚNG TRỌNG TÂM.
+# ================== ĐỌC CSV & TIỆN ÍCH ==================
+def load_catalog(path: str) -> pd.DataFrame:
+    df = None
+    for enc in ["utf-8", "utf-8-sig", "latin1", "cp1252", "gb18030"]:
+        try:
+            df = pd.read_csv(path, encoding=enc)
+            break
+        except Exception:
+            pass
+    if df is None:
+        logger.warning("Không đọc được CSV '%s'. BOT vẫn chạy nhưng không tra được sản phẩm.", path)
+        df = pd.DataFrame()
 
-QUY TẮC:
-- Nếu bắt được mã sản phẩm → trả lời từ CSV (hàng thường/cao cấp) rồi hỏi 1 câu duy nhất để chốt.
-- Nếu không bắt được mã → gợi ý 1–2 lựa chọn gần nhất từ CSV.
-- Không nói giá chung chung, không mở đầu dài dòng.
-- Chỉ hỏi 1 câu duy nhất ở cuối.
-- Ngôn ngữ: tiếng Việt hoặc tiếng anh nếu khách hỏi bằng Tiếng Anh
-- Chỉ cần "Xin chào" lần đầu tiên. Khi khách hàng hỏi có mã sản phẩm thì cho họ 2 giá Hàng thường và cao cấp luôn.
-- Không cần hỏi thời gian, khi nào khách chọn hàng thường hay cao cấp mới trả lời thời gian cho họ.
-"""
+    # dọn cột
+    df.columns = [str(c).strip() for c in df.columns]
+    # bỏ cột Unnamed
+    df = df.loc[:, ~df.columns.str.contains("^Unnamed", case=False)]
 
-# ===== CSV =====
-CATALOG = pd.read_csv(CATALOG_PATH)
+    rename_map = {
+        "Mã": "ma",
+        "Hàng thường": "hang_thuong",
+        "Hàng th??ng": "hang_thuong",
+        "Cao cấp": "cao_cap",
+        "Cao c?p": "cao_cap",
+        "Thời gian làm": "thoi_gian_lam",
+        "Th?i gian làm": "thoi_gian_lam",
+    }
+    for k, v in rename_map.items():
+        if k in df.columns:
+            df = df.rename(columns={k: v})
 
-# ===== UTILS =====
-SKU_PAT = re.compile(r"\b([A-Za-z]*\d{2,}[A-Za-z0-9]*)\b", re.I)
-BUDGET_PAT = re.compile(r"(\d+)(?:\s*-\s*(\d+))?\s*(m|tr|triệu|trieu)?", re.I)
+    # đảm bảo các cột quan trọng tồn tại
+    for c in ["ma", "hang_thuong", "cao_cap"]:
+        if c not in df.columns:
+            df[c] = ""
+    return df
 
-def parse_budget(text: str):
-    m = BUDGET_PAT.search(text)
-    if not m: return None
-    lo = int(m.group(1))
-    hi = m.group(2)
-    return (lo, int(hi) if hi else None)  # triệu
+CATALOG = load_catalog(CATALOG_PATH)
 
-def lookup_by_sku(s: str, df: pd.DataFrame) -> pd.DataFrame:
-    s = s.lower()
+def clean_price_text(s: str) -> str:
+    """Chuẩn hóa hiển thị giá: '17m' -> '17 triệu'; '22' -> '22 triệu'."""
+    if not s: return ""
+    s = str(s).strip()
+    m = re.search(r"(\d+)", s)
+    if not m: return s
+    n = m.group(1)
+    return f"{n} triệu"
+
+def find_by_sku_or_keyword(q: str, df: pd.DataFrame) -> pd.Series | None:
+    """Ưu tiên khớp theo mã (chuỗi có số), nếu không thì tìm theo từ khóa trong mọi cột."""
+    if df.empty: return None
+    qn = q.lower()
+
+    # 1) Thử khớp dạng có số (mã sản phẩm: 2187, Ace2187, Exc0601...)
+    m = re.search(r"\b([A-Za-z]*\d{2,}[A-Za-z0-9]*)\b", q)
+    if m:
+        key = m.group(1).lower()
+        mask = pd.Series([False]*len(df))
+        for c in df.columns:
+            try:
+                mask |= df[c].astype(str).str.lower().str.contains(key, na=False)
+            except Exception:
+                pass
+        subset = df[mask]
+        if not subset.empty:
+            return subset.iloc[0]
+
+    # 2) Không có mã: tìm theo từ khóa
     mask = pd.Series([False]*len(df))
     for c in df.columns:
         try:
-            mask |= df[c].astype(str).str.lower().str.contains(s, na=False)
+            mask |= df[c].astype(str).str.lower().str.contains(qn, na=False)
         except Exception:
             pass
-    return df[mask].head(1)
+    subset = df[mask]
+    if not subset.empty:
+        return subset.iloc[0]
+    return None
 
-def render_csv_answer(row: pd.Series, budget=None) -> str:
-    ma = str(row.get("ma","")).strip()
-    ht = str(row.get("hang_thuong","")).strip()
-    cc = str(row.get("cao_cap","")).strip()
-    tg = str(row.get("thoi_gian_lam","")).strip()
-
-    parts = []
-    if ma: parts.append(f"{ma}:")
-    if ht: parts.append(f"Hàng thường {ht}.")
+def make_price_line(row: pd.Series) -> str:
+    ma = (str(row.get("ma","")) or "").strip() or "(không mã)"
+    ht = clean_price_text(row.get("hang_thuong",""))
+    cc = clean_price_text(row.get("cao_cap",""))
+    parts = [ma + ":"]
+    if ht: parts.append(f"Thường {ht}.")
     if cc: parts.append(f"Cao cấp {cc}.")
-    if tg: parts.append(f"Thời gian làm {tg}.")
+    # KHÔNG nêu thời gian theo yêu cầu
+    return " ".join(parts).strip()
 
-    # Gợi ý theo ngân sách
-    if budget:
-        lo, hi = budget
-        def parse_price(s):
-            m = re.search(r"(\d+)", s)
-            return int(m.group(1)) if m else None
-        ht_price = parse_price(ht)
-        cc_price = parse_price(cc)
-        pick = []
-        if ht_price and ((hi and ht_price<=hi) or (not hi and ht_price<=lo)):
-            pick.append("Hàng thường hợp ngân sách.")
-        if cc_price and ((hi and cc_price<=hi) or (not hi and cc_price<=lo)):
-            pick.append("Cao cấp hợp ngân sách.")
-        if pick:
-            parts.append(" / ".join(pick))
+def detect_variant(txt: str) -> str | None:
+    """Trả về 'hang_thuong' hoặc 'cao_cap' nếu người dùng nói rõ."""
+    t = txt.lower()
+    if re.search(r"\b(cao\s*cấp|cao cap)\b", t): return "cao_cap"
+    if re.search(r"\b(thường|thuong)\b", t):     return "hang_thuong"
+    return None
 
-    parts.append("Bạn chọn hàng thường hay cao cấp?")
-    return " ".join(parts)
+# ================== HANDLERS ==================
+async def set_commands(app):
+    cmds = [
+        BotCommand("start", "Bắt đầu"),
+        BotCommand("warranty", "Chế độ bảo hành"),
+        BotCommand("leadtime", "Thời gian sản xuất"),
+        BotCommand("contact", "Liên hệ")
+    ]
+    await app.bot.set_my_commands(cmds)
 
-def search_df(query, df):
-    q = query.lower()
-    mask = pd.Series([False]*len(df))
-    for c in df.columns:
-        try:
-            mask |= df[c].astype(str).str.lower().str.contains(q, na=False)
-        except Exception:
-            pass
-    return df[mask]
-
-def llm_reply(user_text, extra_context=""):
-    prompt = f"Ngữ cảnh thêm:\n{extra_context}\n\nCâu hỏi: {user_text}"
-    resp = oai.responses.create(
-        model=MODEL,
-        input=[{"role":"system","content":SYSTEM_PROMPT},
-               {"role":"user","content":prompt}],
-        temperature=0.2,
-        max_output_tokens=180
-    )
-    return resp.output_text.strip()
-
-# ===== HANDLERS =====
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [[KeyboardButton(MENU_LABELS["catalog"])],
-          [KeyboardButton(MENU_LABELS["warranty"])],
-          [KeyboardButton(MENU_LABELS["leadtime"])],
-          [KeyboardButton(MENU_LABELS["contact"])]]
-    await update.message.reply_text(
-        "Chào mừng bạn đến với ECCues!",
-        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
-    )
-
-async def cmd_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lines = []
-    for _, r in CATALOG.head(10).iterrows():
-        ma = str(r.get("ma","")).strip()
-        ht = str(r.get("hang_thuong","")).strip()
-        cc = str(r.get("cao_cap","")).strip()
-        tg = str(r.get("thoi_gian_lam","")).strip()
-        lines.append(f"{ma}: Thường {ht}, Cao cấp {cc}, {tg}")
-    await update.message.reply_text("\n".join(lines))
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Chào 1 lần duy nhất (lưu cờ greeted theo user)
+    greeted = context.user_data.get("greeted", False)
+    if not greeted:
+        await update.message.reply_text(
+            "Chào mừng bạn đến ECCues. Gõ mã hoặc tên mẫu để xem giá (Thường/Cao cấp).",
+            reply_markup=MAIN_KB
+        )
+        context.user_data["greeted"] = True
+    else:
+        # Không chào lại, chỉ nhắc ngắn
+        await update.message.reply_text("Gõ mã hoặc tên mẫu để xem giá.", reply_markup=MAIN_KB)
 
 async def cmd_warranty(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(WARRANTY_TEXT, parse_mode="Markdown")
@@ -162,61 +189,85 @@ async def cmd_leadtime(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(CONTACT_TEXT, parse_mode="Markdown")
 
+async def cmd_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if CATALOG.empty:
+        await update.message.reply_text("Danh mục chưa có dữ liệu.")
+        return
+    lines = []
+    for _, r in CATALOG.head(10).iterrows():
+        lines.append(make_price_line(r))
+    await update.message.reply_text("\n".join(lines))
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (update.message.text or "").strip()
+    text = (update.message.text or "").strip()
 
-    if txt == MENU_LABELS["catalog"]:
-        await cmd_catalog(update, context); return
-    if txt == MENU_LABELS["warranty"]:
+    # Menu nhanh
+    if text == MENU_LABELS["catalog"]:
+        await cmd_catalog(update, context);  return
+    if text == MENU_LABELS["warranty"]:
         await cmd_warranty(update, context); return
-    if txt == MENU_LABELS["leadtime"]:
+    if text == MENU_LABELS["leadtime"]:
         await cmd_leadtime(update, context); return
-    if txt == MENU_LABELS["contact"]:
-        await cmd_contact(update, context); return
+    if text == MENU_LABELS["contact"]:
+        await cmd_contact(update, context);  return
 
-    budget = parse_budget(txt)
-    m = SKU_PAT.search(txt)
-    if m:
-        sku = m.group(1)
-        df1 = lookup_by_sku(sku, CATALOG)
-        if not df1.empty:
-            ans = render_csv_answer(df1.iloc[0], budget)
-            await update.message.reply_text(ans)
-            return
+    # Nếu người dùng vừa chọn biến thể sau khi đã có sản phẩm trước đó
+    variant = detect_variant(text)
+    last_product = context.user_data.get("last_product")  # lưu mã/ngắn gọn
+    if variant and last_product:
+        # Gửi liên hệ ngay, không lan man
+        await update.message.reply_text(
+            f"Bạn chọn {('Cao cấp' if variant=='cao_cap' else 'Thường')} cho {last_product}.\n\n{CONTACT_TEXT}",
+            parse_mode="Markdown"
+        )
+        # clear context để phiên sau không dính
+        context.user_data.pop("last_product", None)
+        return
 
-    found = search_df(txt, CATALOG).head(3)
-    extra = "\n".join([f"{r['ma']}: Thường {r['hang_thuong']}, Cao cấp {r['cao_cap']}, {r['thoi_gian_lam']}" for _, r in found.iterrows()])
-    ans = llm_reply(txt, extra_context=extra)
-    await update.message.reply_text(ans)
+    # Nhận diện sản phẩm theo mã/từ khóa
+    row = find_by_sku_or_keyword(text, CATALOG)
+    if row is not None:
+        line = make_price_line(row)
+        await update.message.reply_text(line)
+        # lưu lại sản phẩm để nếu người dùng trả lời "cao cấp/thường" thì gửi contact
+        context.user_data["last_product"] = (str(row.get("ma","")) or "").strip() or "mẫu đã chọn"
+        # KHÔNG hỏi thời gian. Chỉ chờ khách nói "cao cấp" hoặc "thường".
+        return
 
-# ===== WEBHOOK SERVER =====
+    # Fallback cực ngắn, không lan man
+    await update.message.reply_text("Vui lòng gửi mã hoặc tên mẫu để báo giá Thường/Cao cấp.")
+
+# ================== AIOHTTP WEB SERVER (Render) ==================
 async def _post_init(app):
-    pass
+    await set_commands(app)
 
 async def health(request):
     return web.Response(text="ok")
 
 async def amain():
     application = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
-
-    # đăng ký handlers (start, catalog, warranty, leadtime, contact, on_text, ...)
-    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("start",    cmd_start))
+    application.add_handler(CommandHandler("warranty", cmd_warranty))
+    application.add_handler(CommandHandler("leadtime", cmd_leadtime))
+    application.add_handler(CommandHandler("contact",  cmd_contact))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    # (nếu bạn có thêm các CommandHandler khác, giữ nguyên)
 
     await application.initialize()
     await application.start()
 
     # Đăng ký webhook với Telegram
     if WEBHOOK_URL:
-        await application.bot.set_webhook(WEBHOOK_URL)
+        await application.bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+        logger.info("Webhook set to %s", WEBHOOK_URL)
+    else:
+        logger.warning("Chưa có WEBHOOK_URL. Hãy set WEBHOOK_URL=https://<service>.onrender.com/telegram")
 
-    # --- AioHTTP server + health + webhook ---
-    async def health(request):
-        return web.Response(text="ok")
-
+    # Aiohttp app: /healthz và /telegram
     async def telegram_webhook(request):
-        data = await request.json()
+        try:
+            data = await request.json()
+        except Exception:
+            return web.Response(status=400, text="bad json")
         update = Update.de_json(data, application.bot)
         await application.process_update(update)
         return web.Response(text="ok")
@@ -230,6 +281,7 @@ async def amain():
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
     await site.start()
+    logger.info("HTTP server started on 0.0.0.0:%s", PORT)
 
     try:
         await asyncio.Event().wait()
@@ -237,7 +289,6 @@ async def amain():
         await application.stop()
         await application.shutdown()
         await runner.cleanup()
-
 
 def main():
     asyncio.run(amain())
