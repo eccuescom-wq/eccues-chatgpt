@@ -47,11 +47,13 @@ CONTACT_TEXT = (
 SYSTEM_PROMPT = """Bạn là trợ lý bán cơ bi-a. Mục tiêu: trả lời NGẮN, ĐÚNG TRỌNG TÂM.
 
 QUY TẮC:
-- Nếu bắt được mã sản phẩm → trả lời từ CSV (hàng thường/cao cấp/thời gian làm) rồi hỏi 1 câu duy nhất để chốt.
+- Nếu bắt được mã sản phẩm → trả lời từ CSV (hàng thường/cao cấp) rồi hỏi 1 câu duy nhất để chốt.
 - Nếu không bắt được mã → gợi ý 1–2 lựa chọn gần nhất từ CSV.
 - Không nói giá chung chung, không mở đầu dài dòng.
 - Chỉ hỏi 1 câu duy nhất ở cuối.
-- Ngôn ngữ: tiếng Việt.
+- Ngôn ngữ: tiếng Việt hoặc tiếng anh nếu khách hỏi bằng Tiếng Anh
+- Chỉ cần "Xin chào" lần đầu tiên. Khi khách hàng hỏi có mã sản phẩm thì cho họ 2 giá Hàng thường và cao cấp luôn.
+- Không cần hỏi thời gian, khi nào khách chọn hàng thường hay cao cấp mới trả lời thời gian cho họ.
 """
 
 # ===== CSV =====
@@ -196,19 +198,33 @@ async def health(request):
 
 async def amain():
     application = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
+
+    # đăng ký handlers (start, catalog, warranty, leadtime, contact, on_text, ...)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    # (nếu bạn có thêm các CommandHandler khác, giữ nguyên)
 
     await application.initialize()
     await application.start()
 
+    # Đăng ký webhook với Telegram
     if WEBHOOK_URL:
         await application.bot.set_webhook(WEBHOOK_URL)
+
+    # --- AioHTTP server + health + webhook ---
+    async def health(request):
+        return web.Response(text="ok")
+
+    async def telegram_webhook(request):
+        data = await request.json()
+        update = Update.de_json(data, application.bot)
+        await application.process_update(update)
+        return web.Response(text="ok")
 
     web_app = web.Application()
     web_app.router.add_get("/", health)
     web_app.router.add_get("/healthz", health)
-    web_app.router.add_post("/telegram", application.webhook_handler())
+    web_app.router.add_post("/telegram", telegram_webhook)
 
     runner = web.AppRunner(web_app)
     await runner.setup()
@@ -221,6 +237,7 @@ async def amain():
         await application.stop()
         await application.shutdown()
         await runner.cleanup()
+
 
 def main():
     asyncio.run(amain())
