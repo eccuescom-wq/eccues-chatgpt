@@ -68,7 +68,7 @@ LEADTIME_TEXT = "⏳ *Thời gian sản xuất*: thường 3–4 tháng (tuỳ m
 CONTACT_TEXT = (
     "📞 *Liên hệ chốt đơn*\n"
     "Telegram: @eccues\n"
-    "Facebook: https://www.facebook.com/share/1CJbMHsZEM/?mibextid=wwXIfr"
+    "Facebook: https://www.facebook.com/ord.exc"
 )
 
 # ================== ĐỌC CSV & TIỆN ÍCH ==================
@@ -192,11 +192,11 @@ def build_catalog_page(df: pd.DataFrame, page: int) -> tuple[str, InlineKeyboard
 # ================== HANDLERS ==================
 async def set_commands(app):
     cmds = [
-        BotCommand("start", "Bắt đầu"),
+        BotCommand("start",    "Bắt đầu"),
+        BotCommand("catalog",  "Danh sách sản phẩm"),
         BotCommand("warranty", "Chế độ bảo hành"),
         BotCommand("leadtime", "Thời gian sản xuất"),
-        BotCommand("contact", "Liên hệ"),
-        BotCommand("catalog", "Danh sách sản phẩm"),
+        BotCommand("contact",  "Liên hệ"),
     ]
     await app.bot.set_my_commands(cmds)
 
